@@ -120,9 +120,14 @@ def init_db() -> bool:
         # 迁移：给 model_configs 表补齐倍率相关列（旧实例可能缺）
         _ensure_column("model_configs", "credit_multiplier", "FLOAT", "DEFAULT 0")
         _ensure_column("model_configs", "credits_raw", "VARCHAR(120)", "DEFAULT ''")
+        _ensure_column("model_configs", "description", "TEXT", "")
+        _ensure_column("model_configs", "upstream_metadata", "TEXT", "")
 
         # 迁移：给 schedules 表加 stop_after 列（daily_checkin 任务的「停止领取时间」）
         _ensure_column("schedules", "stop_after", "DATETIME", "NULL")
+        # Older MySQL versions reject defaults on TEXT. Existing rows may be
+        # NULL; schedule timing treats NULL and an empty config identically.
+        _ensure_column("schedules", "timing_config", "TEXT", "NULL")
 
         # 迁移：给 usage_logs 表加详细用量与真实客户端 IP 列
         _ensure_column("usage_logs", "prompt_tokens", "INT", "NULL")

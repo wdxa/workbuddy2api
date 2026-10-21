@@ -243,6 +243,8 @@ class ModelConfig(Base):
     note = Column(String(255), default="")
     credit_multiplier = Column(Float, default=0)  # 积分消耗倍率；0=免费模型
     credits_raw = Column(String(120), default="")  # 原始 credits 字符串（如 "x0.05" / "x0.00 credits"）
+    description = Column(Text, default="")  # 官方模型说明，独立于用户备注
+    upstream_metadata = Column(Text, default="{}")  # 官方活动规则 / 名称，保留完整时间配置
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -293,6 +295,7 @@ class Schedule(Base):
     name = Column(String(120), default="")
     task = Column(String(40), default="refresh_balances")  # refresh_balances | sync_models | daily_checkin
     interval_minutes = Column(Integer, default=60)
+    timing_config = Column(Text, default="")  # 空值保留系统预设；JSON 为用户执行周期
     enabled = Column(Integer, default=1)  # 0/1
     last_run_at = Column(DateTime, nullable=True)
     next_run_at = Column(DateTime, nullable=True)

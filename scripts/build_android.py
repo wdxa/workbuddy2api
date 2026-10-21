@@ -70,13 +70,13 @@ def prepare() -> None:
     staging.mkdir(parents=True)
     for path in (ROOT / "admin").rglob("*.py"):
         relative = path.relative_to(ROOT)
-        if path.name in ("app_source.py",) or relative == Path("admin/routers/client_profile.py"):
+        if path.name in ("app_source.py",):
             continue
         target = staging / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
     for name in ("upstream_compat.py", "anthropic_adapter.py", "responses_adapter.py",
-                 "responses_projection.py", "desensitize.py", "wb_install.py", "converter.py"):
+                 "responses_projection.py", "desensitize.py", "wb_install.py", "converter.py", "model_metadata.py"):
         shutil.copy2(ROOT / name, staging / name)
     (staging / "desktop/assets").mkdir(parents=True)
     for name in ("__init__.py", "common.py", "runtime.py", "updates.py"):

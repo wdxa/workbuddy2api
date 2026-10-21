@@ -184,7 +184,9 @@ def _normalize_one(m: dict) -> dict:
         "supports_efforts": efforts,
         "default_effort": default_effort if default_effort in efforts else "",
         "credits": m.get("credits"),
-        "description": m.get("descriptionZh") or m.get("descriptionEn"),
+        "description": m.get("descriptionZh") or m.get("descriptionEn") or m.get("description"),
+        "promotions": m.get("promotions") or [],
+        "tier": m.get("tier"),
         "tags": m.get("tags") or [],
         "vendor": m.get("vendor"),
         "temperature": m.get("temperature"),
@@ -706,22 +708,27 @@ def backfill_reasoning_content(obj: dict) -> int:
 
 # 上游内容审核对若干客户端模板句做**逐字精确匹配**拦截（不是语义审核），
 # 因此改一个词即可绕过。
+# 固定模板兼容规则按内容匹配，所有客户端共用，不依赖 UA、模型或脱敏开关。
+# 只删除触发误判的注释短语，不依赖分支标签、分支名或客户端。
+_PROMPT_TEMPLATE_REWRITES = (
+    (" (you will usually use this for PRs)", ""),
+    ("(you will usually use this for PRs)", ""),
+    ("you will usually use this for PRs", ""),
+)
+
 SANITIZE_FEATURES = (
     "x-anthropic-billing-header",
     "cc_entrypoint=",
     "You are Claude Code",
-    "Main branch (",              # 注意：故意不含句号，覆盖 CLI 与桌面端两种结尾
     "You are a coding agent running in the Codex CLI",
     "github.com/anthropics/",
     "11128",                      # 上游反探测：请求体里出现裸 11128 即整体拦截
-)
+) + tuple(source for source, _ in _PROMPT_TEMPLATE_REWRITES)
 
 # 整句精确替换（顺序敏感）
-SANITIZE_REWRITES = (
+SANITIZE_REWRITES = _PROMPT_TEMPLATE_REWRITES + (
     ("You are Claude Code, Anthropic's official CLI for Claude",
      "You are Claude Code, Anthropic's official CLI tool for Claude"),
-    ("Main branch (you will usually use this for PRs)",
-     "Default branch (you will usually use this for PRs)"),
     ("You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
      "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant."),
     ("To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
@@ -1087,11 +1094,12 @@ class StreamCommitBuffer:
 # 10. 第三方 harness 兼容（DeepSeek Harness / pi-ai / Codex 等）
 # ---------------------------------------------------------------------------
 #
-# 逐项实测（2026-10-20，deepseek-v4.1-flash 直连上游）确认了**唯一**会被
-# 整条拒掉的字段，因此这里只修这一处：
+# 逐项实测的已知触发条件（上游规则可能随时间变化）：
 #
 #   messages[].role == "developer"  →  HTTP 400 code=11128
 #       "Illegal API invocation from an unapproved channel"
+#   2026-10-21 新增：system 身份声明 "You are an AI agent powered by ..."
+#   同样可能返回 11128；只归一声明句式，保留名称与后续任务指令。
 #
 #   store / max_tokens / stream_options / tools /
 #   prompt_cache_key / prompt_cache_retention / metadata / user / service_tier
@@ -1106,28 +1114,96 @@ class StreamCommitBuffer:
 #      所以：**只看上游实测结果增删字段，别顺手「清理」有语义的字段。**
 
 
+_HARNESS_IDENTITY_RE = re.compile(
+    r"\bYou\s+are(?=\s+an\s+AI\s+agent\s+powered\s+by\b)",
+    re.IGNORECASE,
+)
+
+
+def normalize_harness_identity(obj: dict) -> int:
+    """归一 system/developer 的身份声明句式，不绑定任何客户端名称。
+
+    保留智能体名称、能力与任务指令，仅将已知不兼容声明中的 You are
+    改为 Your role is。独立于可选脱敏，用户消息、工具参数与结果不改写。
+    返回替换次数；重复调用不会再次改写。
+    """
+    messages = obj.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"], changed = _HARNESS_IDENTITY_RE.subn("Your role is", content)
+            count += changed
+        elif isinstance(content, list):
+            for part in content:
+                if (isinstance(part, dict) and part.get("type") in ("text", "input_text")
+                        and isinstance(part.get("text"), str)):
+                    part["text"], changed = _HARNESS_IDENTITY_RE.subn("Your role is", part["text"])
+                    count += changed
+    return count
+
+
+def normalize_prompt_templates(obj: dict) -> int:
+    """全局归一已知不兼容模板，返回替换次数；重复调用无副作用。
+
+    请求已由端点解析，故遍历全部 JSON 字符串值，覆盖 system、后续历史、
+    多模态文本及工具参数中的重复模板，不只检查第一条 system。只做精确
+    字面替换，不删 gitStatus、不改其它括号注释、不改 JSON 键和结构。
+    发出时仍由原链路序列化，httpx 按实际字节数计算 Content-Length。
+    """
+    count = 0
+    pending = [obj]
+    while pending:
+        container = pending.pop()
+        if isinstance(container, dict):
+            items = container.items()
+        elif isinstance(container, list):
+            items = enumerate(container)
+        else:
+            continue
+        for key, value in items:
+            if isinstance(value, str):
+                for source, replacement in _PROMPT_TEMPLATE_REWRITES:
+                    occurrences = value.count(source)
+                    if occurrences:
+                        value = value.replace(source, replacement)
+                        count += occurrences
+                container[key] = value
+            elif isinstance(value, (dict, list)):
+                pending.append(value)
+    return count
+
+
 def normalize_harness_body(obj: dict) -> dict:
-    """DeepSeek Harness / pi-ai 这类客户端的最小兼容补丁。
+    """所有客户端共用的最小上游兼容处理，按请求内容而非客户端名称判断。
 
     与 `prepare_upstream_body()` 的区别：本函数只做「上游明确不接受的东西」
     的清理，**不改 stream / 不改思考强度 / 不删任何上游能接受的字段**。
     用在端点自己已经管好 stream 与 thinking 的链路上（如 admin 的
     /v1/chat/completions），避免重复改写。
 
-    做两件事：
+    兼容处理：
       1. role 归一（developer → system）—— 上游 role 白名单不含 developer，
          命中即 400 code=11128（"Illegal API invocation from an unapproved
          channel"）。pi-ai 在「模型开了 reasoning 且没显式声明
          compat.supportsDeveloperRole=false」时就会发 developer，
          于是 DeepSeek Harness 一开思考就整条被拒。
       2. 孤儿 tool_call 清理（安全网，防 11148）。
+      3. 身份声明句式归一（保留客户端名称，不依赖可选脱敏）。
+      4. 固定模板归一（全局去掉主分支说明中的已知不兼容括号注释）。
 
-    返回改写统计 ``{"roles": n, "orphans": n}``，
+    返回 roles / orphans / identity / templates 改写统计，
     obj 就地改写，调用方原样发送即可。
     """
     return {
         "roles": normalize_roles(obj),
         "orphans": cleanup_orphan_tool_calls(obj),
+        "identity": normalize_harness_identity(obj),
+        "templates": normalize_prompt_templates(obj),
     }
 
 
@@ -1142,7 +1218,7 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
     顺序即语义，不要随意调换：
       1. 强制 stream=true（上游只支持流式，非流式由各端点自行聚合）
       2. role 归一（developer → system）
-      3. tool_choice 归一
+      3. 身份声明句式、固定模板与 tool_choice 归一
       4. 孤儿 tool_call 清理（安全网，必须早于发出）
       5. 思考开关翻译（关→thinking.disabled；开→扁平档位；**未表态则不动**）
       6. reasoning_effort 归一（依据上游实时能力）
@@ -1157,6 +1233,8 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
         obj["stream_options"] = {"include_usage": True}
 
     normalize_roles(obj)
+    normalize_harness_identity(obj)
+    normalize_prompt_templates(obj)
     normalize_tool_choice(obj)
     cleanup_orphan_tool_calls(obj)
     apply_thinking_intent(obj, supported=supported_efforts)

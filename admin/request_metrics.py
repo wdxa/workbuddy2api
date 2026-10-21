@@ -332,7 +332,8 @@ class TimingMiddleware:
         self.persist = persist
 
     async def __call__(self, scope, receive, send):
-        if scope['type'] != 'http' or not scope.get('path', '').startswith('/v1/'):
+        if (scope['type'] != 'http' or not scope.get('path', '').startswith('/v1/')
+                or scope.get('path', '').rstrip('/') == '/v1/audio/transcriptions'):
             return await self.app(scope, receive, send)
         start = time.perf_counter()
         record = {'id': uuid.uuid4().hex, 'path': scope['path'],
@@ -365,7 +366,10 @@ class TimingMiddleware:
                 record['request_bytes'] += len(message.get('body', b''))
                 record['upload_complete'] = not message.get('more_body', False)
             elif message['type'] == 'http.disconnect':
-                record['outcome'] = 'disconnected'
+                # ASGI may report closure after the final frame; that is a
+                # normal lifecycle event, not a failed response.
+                if not (record['response_complete'] or record['terminal_sent']):
+                    record['outcome'] = 'disconnected'
             return message
         async def timed_send(message):
             elapsed = round((time.perf_counter()-start)*1000, 1)
@@ -400,7 +404,7 @@ class TimingMiddleware:
             raise
         finally:
             record['total_ms'] = round((time.perf_counter()-start)*1000, 1)
-            if record['request_error'] == 'client_disconnected':
+            if record['request_error'] == 'client_disconnected' and not record['upload_complete']:
                 record['outcome'] = 'disconnected'
             elif (record['stream_error'] or (record['status'] or 0) >= 400
                   or record.get('upstream_error') not in (None, 'success')):

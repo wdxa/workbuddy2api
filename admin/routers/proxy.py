@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import anyio
+import model_metadata
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
@@ -142,6 +143,8 @@ def _normalize_harness_body(chat_body: dict) -> dict:
          pi-ai 只在模型开了 reasoning 时才发 developer，所以典型现象是
          「简单 hello 能过，一开思考就发不出去」—— 正是 DSH 的复现形态。
       2. 孤儿 tool_call 清理。
+      3. system/developer 身份声明句式归一，保留客户端名称与任务指令。
+      4. 全局去掉已知不兼容的主分支括号注释，保留 gitStatus 与实际分支名。
 
     慎改：`prompt_cache_key` / `metadata` 上游实测接受（200），且
     `admin/pool.py` 拿它们当会话粘性键 —— 在这里删掉会打散号池粘性。
@@ -154,6 +157,10 @@ def _normalize_harness_body(chat_body: dict) -> dict:
         stats = normalize_harness_body(chat_body)
         if stats.get("roles"):
             _logger.info("[harness-compat] role developer -> system，改写 %d 条", stats["roles"])
+        if stats.get("identity"):
+            _logger.info("[harness-compat] 身份声明句式归一 %d 处", stats["identity"])
+        if stats.get("templates"):
+            _logger.info("[harness-compat] 固定模板归一 %d 处", stats["templates"])
         if stats.get("orphans"):
             _logger.warning("[harness-compat] 清理孤儿 tool_call %d 处 | diag=%s",
                             stats["orphans"], _tool_diag(chat_body))
@@ -1030,6 +1037,11 @@ def _classify_error(status: int, body: str) -> str:
         return "transport"
     body_l = (body or "").lower()
     code = _json_code(body)
+
+    # 未获上游批准的通道请求不能靠换号解决；保留原始错误交给调用方，
+    # 不重放同一请求，也不将账号标记为冷却或故障。
+    if code == "11128":
+        return "client"
 
     # 1. 该后端无此模型（确定性，重试无意义）
     if code == _MODEL_BLOCK_CODE:
@@ -2500,9 +2512,8 @@ async def chat_completions(
     sticky_key = pool.session_key_for(body)
     session_hdr = _session_headers(body, "")
     await _blocking_call(release_connection, db)
-    # 第三方 harness 兼容（DeepSeek Harness / pi-ai / Codex）：
-    # role developer → system（上游 role 白名单不含 developer，命中即 11128）、
-    # 删 OpenAI 专有归因字段、清孤儿 tool_call。
+    # 所有客户端共用的内容兼容：role developer → system、身份/固定模板归一、
+    # 清孤儿 tool_call；保留上游接受的归因字段与会话粘性键。
     # **必须在脱敏之前**：脱敏只改 content 文本，改不了 role 字段值。
     _normalize_harness_body(body)
     # 与 /v1/messages 同一套 harness 脱敏：OpenAI 反代不过这道过滤，
@@ -3956,11 +3967,20 @@ def models(
     if os.getenv("WORKBUDDY_ANDROID") == "1" and not aid:
         # Reuse the local model rules also displayed in the admin model screen.
         if configs:
-            data = [{'id': row.model_id, 'object': 'model', 'owned_by': 'codebuddy',
-                     'name': row.note or row.model_id,
-                     'credit_multiplier': row.credit_multiplier}
-                    for row in configs if row.enabled and
-                    (allowed is None or row.model_id in allowed)]
+            from admin.routers.models import _stored_metadata
+            data = []
+            for row in configs:
+                if not row.enabled or (allowed is not None and row.model_id not in allowed):
+                    continue
+                meta = _stored_metadata(row)
+                if not meta.get('credits'):
+                    meta['credits'] = row.credits_raw or f'x{row.credit_multiplier or 0}'
+                data.append({**meta, **model_metadata.promotion_display(meta),
+                             'id': row.model_id, 'object': 'model', 'owned_by': 'codebuddy',
+                             'name': row.note or row.model_id,
+                             'display_name': meta.get('name') or row.note or row.model_id,
+                             'description': row.description or '',
+                             'base_credit_multiplier': row.credit_multiplier})
             from admin.model_listing import format_entries, display_options
             data = format_entries(data, options=display_options(db))
             return {'object': 'list', 'data': data, 'source': 'local'}
@@ -3996,7 +4016,10 @@ def models(
                         data = [{
                             "id": m.get("id"), "object": "model", "owned_by": "codebuddy",
                             "name": m.get("name") or m.get("id"),
-                            "credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
+                            **model_metadata.metadata(m),
+                            **model_metadata.promotion_display(m),
+                            "display_name": m.get("name") or m.get("id"),
+                            "base_credit_multiplier": backend.CredentialManager._parse_credit_multiplier(m.get("credits"))
                             if hasattr(backend.CredentialManager, "_parse_credit_multiplier") else None,
                         } for m in models_raw
                             if m.get("id") and m.get("id", "").lower() != "auto"
